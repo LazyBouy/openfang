@@ -545,8 +545,14 @@ impl OpenFangKernel {
             .sqlite_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
+        let qmd_config = config.memory.qmd_mcp_url.as_ref().map(|url| {
+            openfang_memory::qmd::QmdConfig {
+                base_url: url.clone(),
+                timeout_ms: config.memory.qmd_timeout_ms,
+            }
+        });
         let memory = Arc::new(
-            MemorySubstrate::open(&db_path, config.memory.decay_rate)
+            MemorySubstrate::open(&db_path, config.memory.decay_rate, qmd_config)
                 .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
         );
 

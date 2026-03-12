@@ -1427,10 +1427,22 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+    /// Base URL of the qmd MCP HTTP daemon for hybrid recall augmentation.
+    /// Example: `"http://127.0.0.1:7384"`. When set, every agent recall fans out
+    /// to both local SQLite and qmd concurrently. `None` (default) = disabled.
+    #[serde(default)]
+    pub qmd_mcp_url: Option<String>,
+    /// Per-request timeout for qmd MCP calls in milliseconds. Default: 2000.
+    #[serde(default = "default_qmd_timeout_ms")]
+    pub qmd_timeout_ms: u64,
 }
 
 fn default_consolidation_interval() -> u64 {
     24
+}
+
+fn default_qmd_timeout_ms() -> u64 {
+    2000
 }
 
 impl Default for MemoryConfig {
@@ -1443,6 +1455,8 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            qmd_mcp_url: None,
+            qmd_timeout_ms: default_qmd_timeout_ms(),
         }
     }
 }

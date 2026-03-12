@@ -33,11 +33,22 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+    /// Optional qmd MCP recall backend. When set, every `recall_with_embedding_async`
+    /// call fans out to both local SQLite and qmd concurrently, merging results.
+    qmd: Option<crate::qmd::QmdRecallBackend>,
 }
 
 impl MemorySubstrate {
     /// Open or create a memory substrate at the given database path.
-    pub fn open(db_path: &Path, decay_rate: f32) -> OpenFangResult<Self> {
+    ///
+    /// Pass `qmd_config: Some(cfg)` to enable concurrent qmd recall on every
+    /// `recall_with_embedding_async` call. Pass `None` for local-only behaviour
+    /// (the default when `[memory] qmd_mcp_url` is not set in config).
+    pub fn open(
+        db_path: &Path,
+        decay_rate: f32,
+        qmd_config: Option<crate::qmd::QmdConfig>,
+    ) -> OpenFangResult<Self> {
         let conn = Connection::open(db_path).map_err(|e| OpenFangError::Memory(e.to_string()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -52,6 +63,7 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
+            qmd: qmd_config.map(crate::qmd::QmdRecallBackend::new),
         })
     }
 
@@ -70,6 +82,7 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
+            qmd: None,
         })
     }
 
@@ -359,6 +372,11 @@ impl MemorySubstrate {
     }
 
     /// Async wrapper for `recall_with_embedding` — runs in a blocking thread.
+    ///
+    /// If a qmd backend is configured, also queries qmd concurrently and merges
+    /// results: content-deduplicates, re-sorts by confidence descending, and
+    /// truncates to `limit`. On qmd error/timeout the local results are returned
+    /// unchanged.
     pub async fn recall_with_embedding_async(
         &self,
         query: &str,
@@ -367,13 +385,46 @@ impl MemorySubstrate {
         query_embedding: Option<&[f32]>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
         let store = self.semantic.clone();
-        let query = query.to_string();
+        let query_owned = query.to_string();
         let embedding_owned = query_embedding.map(|e| e.to_vec());
-        tokio::task::spawn_blocking(move || {
-            store.recall_with_embedding(&query, limit, filter, embedding_owned.as_deref())
-        })
-        .await
-        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+
+        // Spawn local SQLite recall on a blocking thread (existing behaviour).
+        let local_future = tokio::task::spawn_blocking(move || {
+            store.recall_with_embedding(&query_owned, limit, filter, embedding_owned.as_deref())
+        });
+
+        // Spawn concurrent qmd recall if a backend is configured.
+        let qmd_future = self.qmd.as_ref().map(|backend| {
+            let b = backend.clone();
+            let q = query.to_string();
+            tokio::spawn(async move { b.query(&q, limit).await })
+        });
+
+        // Await local result first.
+        let mut fragments = local_future
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))??;
+
+        // Merge qmd results when available.
+        if let Some(handle) = qmd_future {
+            if let Ok(qmd_results) = handle.await {
+                let existing: std::collections::HashSet<&str> =
+                    fragments.iter().map(|f| f.content.as_str()).collect();
+                for frag in qmd_results {
+                    if !existing.contains(frag.content.as_str()) {
+                        fragments.push(frag);
+                    }
+                }
+                fragments.sort_by(|a, b| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                fragments.truncate(limit);
+            }
+        }
+
+        Ok(fragments)
     }
 
     /// Async wrapper for `remember_with_embedding` — runs in a blocking thread.

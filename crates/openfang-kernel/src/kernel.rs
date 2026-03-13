@@ -545,15 +545,30 @@ impl OpenFangKernel {
             .sqlite_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
-        let qmd_config = config.memory.qmd_mcp_url.as_ref().map(|url| {
-            openfang_memory::qmd::QmdConfig {
-                base_url: url.clone(),
-                timeout_ms: config.memory.qmd_timeout_ms,
-            }
-        });
+        // Build MCP memory backends sorted by rank ascending.
+        let mut mcp_services: Vec<openfang_memory::mcp_memory::McpMemoryBackend> = config
+            .memory
+            .mcp_services
+            .iter()
+            .map(|cfg| {
+                tracing::info!(
+                    name = %cfg.name,
+                    rank = cfg.rank,
+                    url = %cfg.mcp_url,
+                    "Registering MCP memory service"
+                );
+                openfang_memory::mcp_memory::McpMemoryBackend::new(cfg)
+            })
+            .collect();
+        mcp_services.sort_by_key(|s| s.rank);
         let memory = Arc::new(
-            MemorySubstrate::open(&db_path, config.memory.decay_rate, qmd_config)
-                .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
+            MemorySubstrate::open(
+                &db_path,
+                config.memory.decay_rate,
+                mcp_services,
+                config.memory.sqlite_rank,
+            )
+            .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
         );
 
         // Create LLM driver.

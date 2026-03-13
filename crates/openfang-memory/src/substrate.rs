@@ -25,6 +25,15 @@ use std::sync::{Arc, Mutex};
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SQLite connection.
+///
+/// ## External MCP memory services
+///
+/// Zero or more external MCP-based memory services can be registered via
+/// `mcp_services`. They are stored **sorted by rank ascending** at construction
+/// time and tried in that order during every recall call. SQLite sits at
+/// `sqlite_rank` (default `1000`) in the same chain. The fallback rule:
+/// - If a service is **unreachable** → skip to the next rank.
+/// - If a service **responds** (even empty) → trust it and stop the chain.
 pub struct MemorySubstrate {
     conn: Arc<Mutex<Connection>>,
     structured: StructuredStore,
@@ -33,21 +42,23 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
-    /// Optional qmd MCP recall backend. When set, every `recall_with_embedding_async`
-    /// call fans out to both local SQLite and qmd concurrently, merging results.
-    qmd: Option<crate::qmd::QmdRecallBackend>,
+    /// External MCP memory backends, sorted by `rank` ascending at construction.
+    mcp_services: Vec<crate::mcp_memory::McpMemoryBackend>,
+    /// Where SQLite sits in the fallback chain. Default `1000` (lowest priority).
+    sqlite_rank: u32,
 }
 
 impl MemorySubstrate {
     /// Open or create a memory substrate at the given database path.
     ///
-    /// Pass `qmd_config: Some(cfg)` to enable concurrent qmd recall on every
-    /// `recall_with_embedding_async` call. Pass `None` for local-only behaviour
-    /// (the default when `[memory] qmd_mcp_url` is not set in config).
+    /// `mcp_services` should already be **sorted by rank ascending** — the kernel
+    /// is responsible for sorting before calling this. `sqlite_rank` controls where
+    /// the internal SQLite store sits in the fallback chain (default `1000`).
     pub fn open(
         db_path: &Path,
         decay_rate: f32,
-        qmd_config: Option<crate::qmd::QmdConfig>,
+        mcp_services: Vec<crate::mcp_memory::McpMemoryBackend>,
+        sqlite_rank: u32,
     ) -> OpenFangResult<Self> {
         let conn = Connection::open(db_path).map_err(|e| OpenFangError::Memory(e.to_string()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
@@ -63,11 +74,12 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
-            qmd: qmd_config.map(crate::qmd::QmdRecallBackend::new),
+            mcp_services,
+            sqlite_rank,
         })
     }
 
-    /// Create an in-memory substrate (for testing).
+    /// Create an in-memory substrate (for testing). No MCP services are attached.
     pub fn open_in_memory(decay_rate: f32) -> OpenFangResult<Self> {
         let conn =
             Connection::open_in_memory().map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -82,7 +94,8 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
-            qmd: None,
+            mcp_services: vec![],
+            sqlite_rank: 1000,
         })
     }
 
@@ -371,12 +384,17 @@ impl MemorySubstrate {
         self.semantic.update_embedding(id, embedding)
     }
 
-    /// Async wrapper for `recall_with_embedding` — runs in a blocking thread.
+    /// Async wrapper for `recall_with_embedding` with ranked MCP fallback chain.
     ///
-    /// If a qmd backend is configured, also queries qmd concurrently and merges
-    /// results: content-deduplicates, re-sorts by confidence descending, and
-    /// truncates to `limit`. On qmd error/timeout the local results are returned
-    /// unchanged.
+    /// ## Fallback semantics
+    ///
+    /// Services (MCP + SQLite) are tried in ascending rank order. For each service:
+    /// - **Unreachable / timeout** → skip, try next rank.
+    /// - **Responded** (even with empty results) → trust the answer, stop the chain.
+    ///
+    /// This means: if an external service is up and returns nothing relevant, the
+    /// chain stops and returns empty rather than silently promoting a lower-ranked
+    /// source. Promotion only happens when a service is actually down.
     pub async fn recall_with_embedding_async(
         &self,
         query: &str,
@@ -384,47 +402,72 @@ impl MemorySubstrate {
         filter: Option<MemoryFilter>,
         query_embedding: Option<&[f32]>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
-        let store = self.semantic.clone();
-        let query_owned = query.to_string();
-        let embedding_owned = query_embedding.map(|e| e.to_vec());
+        let sqlite_rank = self.sqlite_rank;
 
-        // Spawn local SQLite recall on a blocking thread (existing behaviour).
-        let local_future = tokio::task::spawn_blocking(move || {
-            store.recall_with_embedding(&query_owned, limit, filter, embedding_owned.as_deref())
-        });
-
-        // Spawn concurrent qmd recall if a backend is configured.
-        let qmd_future = self.qmd.as_ref().map(|backend| {
-            let b = backend.clone();
-            let q = query.to_string();
-            tokio::spawn(async move { b.query(&q, limit).await })
-        });
-
-        // Await local result first.
-        let mut fragments = local_future
-            .await
-            .map_err(|e| OpenFangError::Internal(e.to_string()))??;
-
-        // Merge qmd results when available.
-        if let Some(handle) = qmd_future {
-            if let Ok(qmd_results) = handle.await {
-                let existing: std::collections::HashSet<&str> =
-                    fragments.iter().map(|f| f.content.as_str()).collect();
-                for frag in qmd_results {
-                    if !existing.contains(frag.content.as_str()) {
-                        fragments.push(frag);
-                    }
+        // ── Phase 1: MCP services ranked higher than SQLite ──────────────────
+        for svc in self.mcp_services.iter().take_while(|s| s.rank < sqlite_rank) {
+            match svc.query(query, limit).await {
+                Some(results) => {
+                    tracing::debug!(
+                        service = %svc.name,
+                        rank = svc.rank,
+                        count = results.len(),
+                        "MCP memory service responded, stopping recall chain"
+                    );
+                    return Ok(results);
                 }
-                fragments.sort_by(|a, b| {
-                    b.confidence
-                        .partial_cmp(&a.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                fragments.truncate(limit);
+                None => {
+                    // Service unreachable — fall through to next rank
+                }
             }
         }
 
-        Ok(fragments)
+        // ── Phase 2: SQLite (internal store) ─────────────────────────────────
+        let store = self.semantic.clone();
+        let query_owned = query.to_string();
+        let embedding_owned = query_embedding.map(|e| e.to_vec());
+        let sqlite_results = tokio::task::spawn_blocking(move || {
+            store.recall_with_embedding(&query_owned, limit, filter, embedding_owned.as_deref())
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))??;
+
+        // If there are MCP services ranked lower than SQLite, only skip SQLite
+        // when it returned results (analogous to MCP: "responded → stop").
+        // If SQLite returned results, we're done.
+        if !sqlite_results.is_empty()
+            || !self
+                .mcp_services
+                .iter()
+                .any(|s| s.rank > sqlite_rank)
+        {
+            return Ok(sqlite_results);
+        }
+
+        // ── Phase 3: MCP services ranked lower than SQLite (sqlite returned empty)
+        for svc in self
+            .mcp_services
+            .iter()
+            .skip_while(|s| s.rank <= sqlite_rank)
+        {
+            match svc.query(query, limit).await {
+                Some(results) => {
+                    tracing::debug!(
+                        service = %svc.name,
+                        rank = svc.rank,
+                        count = results.len(),
+                        "Low-rank MCP memory service responded, stopping recall chain"
+                    );
+                    return Ok(results);
+                }
+                None => {
+                    // Service unreachable — fall through to next rank
+                }
+            }
+        }
+
+        // All services exhausted — return SQLite's empty result
+        Ok(sqlite_results)
     }
 
     /// Async wrapper for `remember_with_embedding` — runs in a blocking thread.

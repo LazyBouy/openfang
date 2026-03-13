@@ -1427,21 +1427,59 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
-    /// Base URL of the qmd MCP HTTP daemon for hybrid recall augmentation.
-    /// Example: `"http://127.0.0.1:7384"`. When set, every agent recall fans out
-    /// to both local SQLite and qmd concurrently. `None` (default) = disabled.
+    /// External MCP-based memory services to attach to the recall chain.
+    ///
+    /// Each entry is tried in ascending `rank` order. The first service that
+    /// responds (even with empty results) wins; a service is skipped only when
+    /// it is unreachable or times out. The built-in SQLite store sits at
+    /// `sqlite_rank` in the same chain.
+    ///
+    /// ```toml
+    /// [[memory.mcp_services]]
+    /// name       = "qmd-notes"
+    /// mcp_url    = "http://127.0.0.1:7384"
+    /// timeout_ms = 2000
+    /// rank       = 1
+    ///
+    /// [[memory.mcp_services]]
+    /// name       = "qmd-docs"
+    /// mcp_url    = "http://127.0.0.1:7385"
+    /// timeout_ms = 3000
+    /// rank       = 2
+    /// ```
     #[serde(default)]
-    pub qmd_mcp_url: Option<String>,
-    /// Per-request timeout for qmd MCP calls in milliseconds. Default: 2000.
-    #[serde(default = "default_qmd_timeout_ms")]
-    pub qmd_timeout_ms: u64,
+    pub mcp_services: Vec<McpMemoryServiceConfig>,
+    /// Rank of the internal SQLite memory store in the fallback chain.
+    /// Default `1000` — external services with rank < 1000 take precedence.
+    /// Set to `1` to make SQLite highest-priority (MCP services become fallbacks).
+    #[serde(default = "default_sqlite_rank")]
+    pub sqlite_rank: u32,
+}
+
+/// Configuration for a single external MCP memory service.
+/// Serialised as an array-of-tables entry under `[[memory.mcp_services]]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpMemoryServiceConfig {
+    /// Human-readable label used in log messages.
+    pub name: String,
+    /// Base URL of the MCP HTTP server (without the `/mcp` path).
+    pub mcp_url: String,
+    /// Per-request timeout in milliseconds. Default: 2000.
+    #[serde(default = "default_mcp_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Priority rank — lower = higher priority. SQLite uses `sqlite_rank` (default 1000).
+    pub rank: u32,
 }
 
 fn default_consolidation_interval() -> u64 {
     24
 }
 
-fn default_qmd_timeout_ms() -> u64 {
+fn default_sqlite_rank() -> u32 {
+    1000
+}
+
+fn default_mcp_timeout_ms() -> u64 {
     2000
 }
 
@@ -1455,8 +1493,8 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
-            qmd_mcp_url: None,
-            qmd_timeout_ms: default_qmd_timeout_ms(),
+            mcp_services: vec![],
+            sqlite_rank: default_sqlite_rank(),
         }
     }
 }

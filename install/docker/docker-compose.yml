@@ -13,10 +13,10 @@
 # PERSISTENT STATE
 # ----------------
 # All OpenFang state (config, SQLite DB, agents, skills) is stored on the host
-# under OPENFANG_STATE_PATH (see .env).  The host path is mounted as /data
-# inside the container and OPENFANG_HOME is set to /data.
+# under ${AGENT_STATE_BASE}/openfang (see .env).  The host path is mounted as
+# /data inside the container and OPENFANG_HOME is set to /data.
 #
-#   ${OPENFANG_STATE_PATH}/
+#   ${AGENT_STATE_BASE}/openfang/
 #   ├── config.toml            ← OpenFang configuration
 #   ├── data/
 #   │   └── openfang.db        ← SQLite memory / sessions / usage
@@ -28,29 +28,31 @@
 #
 # SHARED NETWORK
 # --------------
-# The service joins the "${AGENT_NETWORK}" bridge network (default: agent-phi).
-# Other containers (qmd, paperclip, additional agent runtimes, etc.) can reach
-# OpenFang at http://openfang:4200 by attaching to the same network:
+# The service joins the "${AGENT_NETWORK}" external network (default: agent-phi).
+# Create the network once before first boot:
+#   docker network create ${AGENT_NETWORK:-agent-phi}
 #
-#   # In another docker-compose.yml:
+# Other containers (qmd, paperclip, etc.) can reach OpenFang at
+# http://openfang:4200 by joining the same network:
+#
 #   networks:
 #     agent-net:
-#       name: agent-phi    # must match AGENT_NETWORK in your .env
 #       external: true
+#       name: ${AGENT_NETWORK:-agent-phi}
 #
-# The network is created by this compose file.  Set its name once via
-# AGENT_NETWORK in .env so every stack in the ecosystem agrees on the name.
+# Set the name once via AGENT_NETWORK in .env so every stack agrees on it.
 #
 # =============================================================================
 
 name: openfang
 
 networks:
-  # Shared bridge network for the entire agent-phi ecosystem.
-  # All co-located services (qmd, paperclip, etc.) should join this network.
+  # Shared external network for the entire agent-phi ecosystem.
+  # Create it once before first boot:  docker network create agent-phi
+  # All co-located services (qmd, paperclip, etc.) join by declaring it external.
   agent-net:
+    external: true
     name: ${AGENT_NETWORK:-agent-phi}
-    driver: bridge
 
 services:
   openfang:
@@ -73,7 +75,7 @@ services:
     # The directory is created on the host if it does not already exist.
     volumes:
       - type: bind
-        source: ${OPENFANG_STATE_PATH:-~/agent-phi/state/openfang}
+        source: ${AGENT_STATE_BASE:-~/agent-phi/state}/openfang
         target: /data
         bind:
           create_host_path: true

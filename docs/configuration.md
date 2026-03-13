@@ -13,6 +13,7 @@ Complete reference for `config.toml`, covering every configurable field in the O
   - [Top-Level Fields](#top-level-fields)
   - [\[default\_model\]](#default_model)
   - [\[memory\]](#memory)
+  - [\[\[memory.mcp\_services\]\]](#memorymcp_services)
   - [\[network\]](#network)
   - [\[web\]](#web)
   - [\[channels\]](#channels)
@@ -115,6 +116,22 @@ api_key_env = "GROQ_API_KEY"
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
+sqlite_rank = 1000                   # Where SQLite sits in the recall chain (default = last)
+
+# --- External MCP Memory Services (optional, repeatable) ---
+# Tried in ascending rank order before SQLite. First service that responds wins.
+# Any MCP server exposing a `query` tool with {query, limit} args is compatible.
+[[memory.mcp_services]]
+name       = "qmd-notes"             # Label used in log messages
+mcp_url    = "http://127.0.0.1:7384" # Base URL (without /mcp path)
+timeout_ms = 2000                    # Per-request timeout
+rank       = 1                       # Lower rank = higher priority
+
+# [[memory.mcp_services]]
+# name       = "qmd-docs"
+# mcp_url    = "http://127.0.0.1:7385"
+# timeout_ms = 3000
+# rank       = 2
 
 # --- Network (OFP Wire Protocol) ---
 [network]
@@ -276,7 +293,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 ### `[memory]`
 
-Configures the SQLite-backed memory substrate, including vector embeddings and memory decay.
+Configures the SQLite-backed memory substrate, vector embeddings, memory decay, and the ranked MCP memory fallback chain.
 
 ```toml
 [memory]
@@ -284,6 +301,7 @@ Configures the SQLite-backed memory substrate, including vector embeddings and m
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
+sqlite_rank = 1000
 ```
 
 | Field | Type | Default | Description |
@@ -292,6 +310,50 @@ decay_rate = 0.1
 | `embedding_model` | string | `"all-MiniLM-L6-v2"` | Model name used for generating vector embeddings for semantic memory search. |
 | `consolidation_threshold` | u64 | `10000` | Number of stored memories before automatic consolidation is triggered to merge and prune old entries. |
 | `decay_rate` | f32 | `0.1` | Memory confidence decay rate. `0.0` = no decay (memories never fade), `1.0` = aggressive decay. Values between 0.0 and 1.0. |
+| `sqlite_rank` | u32 | `1000` | Position of the internal SQLite store in the recall fallback chain. External MCP services with `rank < sqlite_rank` are tried before SQLite. Set to `1` to make SQLite the highest-priority source. |
+
+---
+
+### `[[memory.mcp_services]]`
+
+Defines external MCP-based memory services attached to the recall chain. This is an array-of-tables — repeat the section to add multiple services.
+
+**How the chain works:**
+
+Each service is tried in ascending `rank` order. The first service that **responds** (even with an empty result set) wins and terminates the chain. A service is only skipped when it is **unreachable or timed out** — in that case the next rank is tried. The internal SQLite store sits at `sqlite_rank` (default `1000`) in the same ordered list.
+
+```
+rank 1  →  mcp_service A  (tried first)
+rank 2  →  mcp_service B  (tried if A is down)
+rank 1000 →  SQLite       (tried if all MCP services above it are down)
+```
+
+**MCP tool contract:** The external server must expose a tool named `query` that accepts `{ "query": string, "limit": integer }` and returns a JSON array of objects with at least `content: string`, and optionally `score: float` (0–1) and `path: string`.
+
+```toml
+[[memory.mcp_services]]
+name       = "qmd-notes"
+mcp_url    = "http://127.0.0.1:7384"
+timeout_ms = 2000
+rank       = 1
+
+[[memory.mcp_services]]
+name       = "qmd-docs"
+mcp_url    = "http://127.0.0.1:7385"
+timeout_ms = 3000
+rank       = 2
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | — | Human-readable label used in log messages to identify this service. |
+| `mcp_url` | string | — | Base URL of the MCP HTTP daemon (without the `/mcp` path). E.g. `"http://127.0.0.1:7384"`. |
+| `timeout_ms` | u64 | `2000` | Per-request HTTP timeout in milliseconds. If the service does not respond within this window it is treated as unreachable and the next rank is tried. |
+| `rank` | u32 | — | Priority position in the fallback chain. Lower = higher priority. Must be lower than `sqlite_rank` (default 1000) for the service to take precedence over the local SQLite store. |
+
+**Compatible servers (examples):**
+- [qmd](https://github.com/tobi/qmd) — local hybrid BM25 + vector + LLM re-ranking search. Start with `qmd mcp --http --daemon`.
+- Any custom MCP HTTP server implementing the `query` tool contract above.
 
 ---
 

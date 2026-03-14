@@ -179,6 +179,56 @@ fn resolve_agent(state: &AppState, model: &str) -> Option<(AgentId, String)> {
         return Some((entry.id, entry.name.clone()));
     }
 
+    // 4. Fall back to the Hand Registry.  If an active instance for this
+    //    hand_id already exists, return its backing agent directly.
+    if let Some(instance) = state
+        .kernel
+        .hand_registry
+        .list_instances()
+        .into_iter()
+        .find(|i| i.hand_id == model)
+    {
+        if let Some(agent_id) = instance.agent_id {
+            if let Some(entry) = state.kernel.registry.get(agent_id) {
+                return Some((entry.id, entry.name.clone()));
+            }
+        }
+    }
+
+    // 5. Auto-activate: if the model name matches a known hand definition,
+    //    activate it on demand so callers (e.g. Paperclip) don't need to
+    //    manage hand activation before invoking /v1/chat/completions.
+    if state.kernel.hand_registry.get_definition(model).is_some() {
+        match state
+            .kernel
+            .activate_hand(model, Default::default())
+        {
+            Ok(instance) => {
+                if let Some(agent_id) = instance.agent_id {
+                    if let Some(entry) = state.kernel.registry.get(agent_id) {
+                        return Some((entry.id, entry.name.clone()));
+                    }
+                }
+            }
+            Err(_) => {
+                // Already active or activation failed — try any existing instance.
+                if let Some(instance) = state
+                    .kernel
+                    .hand_registry
+                    .list_instances()
+                    .into_iter()
+                    .find(|i| i.hand_id == model)
+                {
+                    if let Some(agent_id) = instance.agent_id {
+                        if let Some(entry) = state.kernel.registry.get(agent_id) {
+                            return Some((entry.id, entry.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // No match — return None so the caller returns a proper 404
     None
 }
@@ -530,7 +580,7 @@ async fn stream_response(
         .into_response())
 }
 
-/// GET /v1/models — List available agents as OpenAI model objects.
+/// GET /v1/models — List available agents and hand definitions as OpenAI model objects.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state.kernel.registry.list();
     let created = std::time::SystemTime::now()
@@ -538,7 +588,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .unwrap_or_default()
         .as_secs();
 
-    let models: Vec<ModelObject> = agents
+    let mut models: Vec<ModelObject> = agents
         .iter()
         .map(|e| ModelObject {
             id: format!("openfang:{}", e.name),
@@ -547,6 +597,21 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
             owned_by: "openfang".to_string(),
         })
         .collect();
+
+    // Expose bundled hand definitions as additional model IDs so clients can
+    // discover and invoke hands by name without pre-activating them.
+    let agent_names: std::collections::HashSet<String> =
+        agents.iter().map(|e| e.name.clone()).collect();
+    for def in state.kernel.hand_registry.list_definitions() {
+        if !agent_names.contains(&def.id) {
+            models.push(ModelObject {
+                id: def.id.clone(),
+                object: "model",
+                created,
+                owned_by: "openfang-hand".to_string(),
+            });
+        }
+    }
 
     Json(
         serde_json::to_value(&ModelListResponse {

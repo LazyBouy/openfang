@@ -73,14 +73,20 @@ impl ModelCatalog {
                 continue;
             }
 
-            // Primary: check the provider's declared env var
-            let has_key = std::env::var(&provider.api_key_env).is_ok();
+            // Primary: check the provider's declared env var (must be non-empty)
+            let has_key = std::env::var(&provider.api_key_env)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
 
             // Secondary: provider-specific fallback auth
             let has_fallback = match provider.id.as_str() {
-                "gemini" => std::env::var("GOOGLE_API_KEY").is_ok(),
+                "gemini" => std::env::var("GOOGLE_API_KEY")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false),
                 "codex" => {
-                    std::env::var("OPENAI_API_KEY").is_ok()
+                    std::env::var("OPENAI_API_KEY")
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
                         || read_codex_credential().is_some()
                 }
                 // claude-code is handled above (before key_required check)

@@ -81,6 +81,10 @@ services:
       # Tell OpenFang where its home directory is inside the container.
       OPENFANG_HOME: /data
 
+      # Bind on all interfaces so the host port mapping works.
+      # Default is 127.0.0.1:50051 — must override for Docker.
+      OPENFANG_LISTEN: "0.0.0.0:4200"
+
       # Runtime settings — override in .env as needed.
       RUST_LOG: ${OPENFANG_LOG_LEVEL:-info}
       OPENFANG_API_KEY: ${OPENFANG_API_KEY:-}

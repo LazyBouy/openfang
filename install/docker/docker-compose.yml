@@ -13,34 +13,30 @@
 # PERSISTENT STATE
 # ----------------
 # All OpenFang state (config, SQLite DB, agents, skills) is stored on the host
-# under ${AGENT_STATE_BASE}/openfang (see .env).  The host path is mounted as
+# under ${AGENT_BASE}/state/openfang (see .env).  The host path is mounted as
 # /data inside the container and OPENFANG_HOME is set to /data.
 #
-#   ${AGENT_STATE_BASE}/openfang/
+#   ${AGENT_BASE}/state/openfang/
 #   ├── config.toml            ← OpenFang configuration
 #   ├── data/
 #   │   └── openfang.db        ← SQLite memory / sessions / usage
 #   ├── agents/                ← Agent manifests
 #   └── skills/                ← Installed skills
 #
-# To pre-configure OpenFang, place a config.toml in OPENFANG_STATE_PATH before
-# first boot.  On first run the directory is created automatically if absent.
+# To pre-configure OpenFang place a config.toml there before first boot.
+# On first run the directory is created automatically if absent.
 #
 # SHARED NETWORK
 # --------------
-# The service joins the "${AGENT_NETWORK}" external network (default: agent-phi).
+# The service joins the AGENT_NETWORK external bridge network.
+# By convention AGENT_NETWORK = last path segment of AGENT_BASE
+# (e.g. AGENT_BASE=~/agent-phi  →  AGENT_NETWORK=agent-phi).
 # Create the network once before first boot:
 #   docker network create ${AGENT_NETWORK:-agent-phi}
 #
-# Other containers (qmd, paperclip, etc.) can reach OpenFang at
-# http://openfang:4200 by joining the same network:
-#
-#   networks:
-#     agent-net:
-#       external: true
-#       name: ${AGENT_NETWORK:-agent-phi}
-#
-# Set the name once via AGENT_NETWORK in .env so every stack agrees on it.
+# Other containers (qmd, paperclip, etc.) join the same network and can reach
+# OpenFang at http://openfang:4200.
+# Set both AGENT_BASE and AGENT_NETWORK in .env — see .env.example.
 #
 # =============================================================================
 
@@ -56,10 +52,10 @@ networks:
 
 services:
   openfang:
-    # Build from source (repo root contains the Dockerfile).
+    # Build from source — context is the repo root, Dockerfile is at install/docker/Dockerfile.
     build:
       context: ../..
-      dockerfile: Dockerfile
+      dockerfile: install/docker/Dockerfile
     image: openfang:local
     container_name: openfang
 
@@ -71,11 +67,11 @@ services:
       - "${OPENFANG_PORT:-4200}:4200"
 
     # ── Persistent volumes ────────────────────────────────────────────────────
-    # Host path (OPENFANG_STATE_PATH) → /data inside the container.
+    # ${AGENT_BASE}/state/openfang on the host → /data inside the container.
     # The directory is created on the host if it does not already exist.
     volumes:
       - type: bind
-        source: ${AGENT_STATE_BASE:-~/agent-phi/state}/openfang
+        source: ${AGENT_BASE:-~/agent-phi}/state/openfang
         target: /data
         bind:
           create_host_path: true
@@ -87,6 +83,7 @@ services:
 
       # Runtime settings — override in .env as needed.
       RUST_LOG: ${OPENFANG_LOG_LEVEL:-info}
+      OPENFANG_API_KEY: ${OPENFANG_API_KEY:-}
 
       # LLM provider keys — pulled from .env on the host.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

@@ -3743,6 +3743,25 @@ impl OpenFangKernel {
             }
         }
 
+        // MCP memory sync — probes configured memory services every 60s and backfills
+        // any memories that were written to SQLite while a service was offline.
+        if self.memory.has_mcp_services() {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // Skip first immediate tick so startup isn't noisy
+                loop {
+                    interval.tick().await;
+                    if kernel.supervisor.is_shutting_down() {
+                        break;
+                    }
+                    kernel.memory.sync_mcp_services().await;
+                }
+            });
+            info!("MCP memory sync task started (60s interval)");
+        }
+
         // Connect to configured + extension MCP servers
         let has_mcp = self
             .effective_mcp_servers

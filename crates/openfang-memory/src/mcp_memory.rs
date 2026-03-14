@@ -53,6 +53,10 @@ pub struct McpMemoryBackend {
     pub rank: u32,
     /// REST query endpoint: `{mcp_url}/query`
     query_endpoint: String,
+    /// REST ingest endpoint: `{mcp_url}/ingest`
+    ingest_endpoint: String,
+    /// Health probe endpoint: `{mcp_url}/health`
+    health_endpoint: String,
 }
 
 impl McpMemoryBackend {
@@ -63,11 +67,14 @@ impl McpMemoryBackend {
             .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
             .build()
             .expect("reqwest client build failed");
+        let base = cfg.mcp_url.trim_end_matches('/');
         Self {
             client,
             name: cfg.name.clone(),
             rank: cfg.rank,
-            query_endpoint: format!("{}/query", cfg.mcp_url.trim_end_matches('/')),
+            query_endpoint: format!("{base}/query"),
+            ingest_endpoint: format!("{base}/ingest"),
+            health_endpoint: format!("{base}/health"),
         }
     }
 
@@ -79,9 +86,14 @@ impl McpMemoryBackend {
     /// - `Some(vec)` — service responded successfully; vec may be empty
     ///   (caller should stop the chain and trust the service's answer)
     pub async fn query(&self, query: &str, limit: usize) -> Option<Vec<MemoryFragment>> {
-        // QMD REST format: { searches: [{type: "vec", query: "..."}], limit: N }
+        // QMD REST format: send both vec (semantic) and lex (keyword) searches.
+        // Freshly ingested memories are BM25-indexed immediately but not yet embedded,
+        // so lex search ensures they are found before `qmd embed` runs.
         let body = serde_json::json!({
-            "searches": [{ "type": "vec", "query": query }],
+            "searches": [
+                { "type": "vec", "query": query },
+                { "type": "lex", "query": query },
+            ],
             "limit": limit
         });
 
@@ -199,6 +211,98 @@ impl McpMemoryBackend {
 
         Some(fragments) // Some(empty) = service up but returned no matches
     }
+
+    /// Push one memory fragment to the remote service via `POST /ingest`.
+    ///
+    /// Returns `true` if the service accepted the fragment (HTTP 2xx), `false` on
+    /// any error (offline, timeout, non-2xx). Failure is non-fatal — the caller
+    /// falls back to keeping the fragment in SQLite for the next backfill cycle.
+    pub async fn push(&self, fragment: &MemoryFragment) -> bool {
+        let content = format_fragment_as_markdown(fragment);
+        let path = format!(
+            "{}/{}/{}.md",
+            fragment.agent_id.0,
+            fragment.created_at.format("%Y-%m"),
+            fragment.id.0,
+        );
+
+        let body = serde_json::json!({
+            "collection": "openfang-memories",
+            "path":       path,
+            "content":    content,
+            "created_at": fragment.created_at.to_rfc3339(),
+        });
+
+        match self.client.post(&self.ingest_endpoint).json(&body).send().await {
+            Ok(r) => {
+                if r.status().is_success() {
+                    tracing::debug!(
+                        service = %self.name,
+                        id      = %fragment.id.0,
+                        "Memory fragment pushed to MCP service"
+                    );
+                    true
+                } else {
+                    tracing::debug!(
+                        service = %self.name,
+                        status  = %r.status(),
+                        "MCP push returned non-2xx, will retry on next sync"
+                    );
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    service = %self.name,
+                    error   = %e,
+                    "MCP push failed (service offline?), will retry on next sync"
+                );
+                false
+            }
+        }
+    }
+
+    /// Returns the health-probe URL for this service (`{mcp_url}/health`).
+    pub fn health_endpoint(&self) -> &str {
+        &self.health_endpoint
+    }
+}
+
+/// Convert an OpenFang `MemoryFragment` into a QMD-indexable markdown document.
+///
+/// The resulting markdown is immediately BM25-searchable after `insertDocument`
+/// and becomes vector-searchable after the next `qmd embed` run.
+fn format_fragment_as_markdown(f: &MemoryFragment) -> String {
+    let title = f
+        .content
+        .lines()
+        .next()
+        .unwrap_or("Memory Fragment")
+        .chars()
+        .take(60)
+        .collect::<String>();
+
+    let source = serde_json::to_string(&f.source)
+        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .trim_matches('"')
+        .to_string();
+
+    format!(
+        "# {title}\n\n\
+         **Agent**: {agent}\n\
+         **Source**: {source}\n\
+         **Scope**: {scope}\n\
+         **Confidence**: {confidence:.2}\n\
+         **Created**: {created_at}\n\n\
+         {content}\n",
+        title = title,
+        agent = f.agent_id.0,
+        source = source,
+        scope = f.scope,
+        confidence = f.confidence,
+        created_at = f.created_at.to_rfc3339(),
+        content = f.content,
+    )
 }
 
 #[cfg(test)]
@@ -225,6 +329,18 @@ mod tests {
     fn endpoint_strips_trailing_slash() {
         let b = make_backend("http://qmd:8181/");
         assert_eq!(b.query_endpoint, "http://qmd:8181/query");
+    }
+
+    #[test]
+    fn ingest_endpoint_uses_ingest_path() {
+        let b = make_backend("http://qmd:8181");
+        assert_eq!(b.ingest_endpoint, "http://qmd:8181/ingest");
+    }
+
+    #[test]
+    fn health_endpoint_uses_health_path() {
+        let b = make_backend("http://qmd:8181");
+        assert_eq!(b.health_endpoint(), "http://qmd:8181/health");
     }
 
     /// Verify the response-mapping logic: title + snippet are combined, score
@@ -293,5 +409,60 @@ mod tests {
 
         let (content1, _score1, _file1) = &fragments[1];
         assert_eq!(content1, "Deployment Guide");
+    }
+
+    #[test]
+    fn format_fragment_has_title_and_metadata() {
+        use openfang_types::{agent::AgentId, memory::{MemoryId, MemorySource}};
+        use std::collections::HashMap;
+
+        let frag = MemoryFragment {
+            id: MemoryId(uuid::Uuid::nil()),
+            agent_id: AgentId(uuid::Uuid::nil()),
+            content: "The user prefers concise answers.".to_string(),
+            embedding: None,
+            metadata: HashMap::new(),
+            source: MemorySource::Conversation,
+            confidence: 0.9,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-03-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            accessed_at: chrono::Utc::now(),
+            access_count: 0,
+            scope: "episodic".to_string(),
+        };
+
+        let md = format_fragment_as_markdown(&frag);
+        assert!(md.starts_with("# The user prefers concise answers."));
+        assert!(md.contains("**Source**: Conversation"));
+        assert!(md.contains("**Scope**: episodic"));
+        assert!(md.contains("**Confidence**: 0.90"));
+        assert!(md.contains("The user prefers concise answers."));
+    }
+
+    #[test]
+    fn format_fragment_title_truncated_at_60() {
+        use openfang_types::{agent::AgentId, memory::{MemoryId, MemorySource}};
+        use std::collections::HashMap;
+
+        let long_line = "A".repeat(80);
+        let frag = MemoryFragment {
+            id: MemoryId(uuid::Uuid::nil()),
+            agent_id: AgentId(uuid::Uuid::nil()),
+            content: long_line.clone(),
+            embedding: None,
+            metadata: HashMap::new(),
+            source: MemorySource::System,
+            confidence: 1.0,
+            created_at: chrono::Utc::now(),
+            accessed_at: chrono::Utc::now(),
+            access_count: 0,
+            scope: "global".to_string(),
+        };
+
+        let md = format_fragment_as_markdown(&frag);
+        let first_line = md.lines().next().unwrap();
+        // "# " prefix + 60 chars = 62 chars
+        assert_eq!(first_line.len(), 62, "title should be truncated to 60 chars");
     }
 }

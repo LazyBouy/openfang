@@ -290,6 +290,90 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Retrieve a single non-deleted memory fragment by its ID.
+    pub fn get_by_id(&self, id: MemoryId) -> OpenFangResult<Option<MemoryFragment>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let result = conn.query_row(
+            "SELECT id, agent_id, content, source, scope, confidence, metadata,
+                    created_at, accessed_at, access_count, embedding
+             FROM memories WHERE id = ?1 AND deleted = 0",
+            [id.0.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                ))
+            },
+        );
+
+        match result {
+            Ok(row) => Ok(Some(map_row(row)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(OpenFangError::Memory(e.to_string())),
+        }
+    }
+
+    /// Return all non-deleted memories created strictly after `since`, ordered ascending.
+    ///
+    /// Used by the backfill task to find memories written during a service outage.
+    pub fn get_memories_since(
+        &self,
+        since_rfc3339: &str,
+    ) -> OpenFangResult<Vec<MemoryFragment>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, content, source, scope, confidence, metadata,
+                        created_at, accessed_at, access_count, embedding
+                 FROM memories
+                 WHERE created_at > ?1 AND deleted = 0
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([since_rfc3339], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                ))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut fragments = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            fragments.push(map_row(row)?);
+        }
+        Ok(fragments)
+    }
+
     /// Update the embedding for an existing memory.
     pub fn update_embedding(&self, id: MemoryId, embedding: &[f32]) -> OpenFangResult<()> {
         let conn = self
@@ -304,6 +388,58 @@ impl SemanticStore {
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
     }
+}
+
+/// Map a raw row tuple (from query_map or query_row) into a MemoryFragment.
+type RawRow = (
+    String, // id
+    String, // agent_id
+    String, // content
+    String, // source
+    String, // scope
+    f64,    // confidence
+    String, // metadata
+    String, // created_at
+    String, // accessed_at
+    i64,    // access_count
+    Option<Vec<u8>>, // embedding
+);
+
+fn map_row(row: RawRow) -> OpenFangResult<MemoryFragment> {
+    let (id_str, agent_str, content, source_str, scope, confidence,
+         meta_str, created_str, accessed_str, access_count, embedding_bytes) = row;
+
+    let id = uuid::Uuid::parse_str(&id_str)
+        .map(MemoryId)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    let agent_id = uuid::Uuid::parse_str(&agent_str)
+        .map(openfang_types::agent::AgentId)
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    let source: MemorySource =
+        serde_json::from_str(&source_str).unwrap_or(MemorySource::System);
+    let metadata: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&meta_str).unwrap_or_default();
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let accessed_at = chrono::DateTime::parse_from_rfc3339(&accessed_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let embedding = embedding_bytes.as_deref().map(embedding_from_bytes);
+
+    Ok(MemoryFragment {
+        id,
+        agent_id,
+        content,
+        embedding,
+        metadata,
+        source,
+        confidence: confidence as f32,
+        created_at,
+        accessed_at,
+        access_count: access_count as u64,
+        scope,
+    })
 }
 
 /// Compute cosine similarity between two vectors.
@@ -517,6 +653,51 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].embedding.is_some());
         assert_eq!(results[0].embedding.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_get_by_id() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let id = store
+            .remember(
+                agent_id,
+                "Findable by ID",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let found = store.get_by_id(id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().content, "Findable by ID");
+
+        let missing = store.get_by_id(MemoryId::new()).unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_get_memories_since() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        // Write two memories. The "since" filter uses created_at which is set to now().
+        // We use a timestamp slightly before now to capture both.
+        let before = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+
+        store
+            .remember(agent_id, "Memory A", MemorySource::Conversation, "episodic", HashMap::new())
+            .unwrap();
+        store
+            .remember(agent_id, "Memory B", MemorySource::Conversation, "episodic", HashMap::new())
+            .unwrap();
+
+        let results = store.get_memories_since(&before).unwrap();
+        assert_eq!(results.len(), 2);
+        // Should be ascending by created_at
+        assert_eq!(results[0].content, "Memory A");
+        assert_eq!(results[1].content, "Memory B");
     }
 
     #[test]

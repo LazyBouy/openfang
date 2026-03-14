@@ -350,6 +350,156 @@ impl MemorySubstrate {
     }
 
     // -----------------------------------------------------------------
+    // MCP sync helpers
+    // -----------------------------------------------------------------
+
+    /// Returns true if any external MCP memory services are configured.
+    /// Used by the kernel to decide whether to start the sync background task.
+    pub fn has_mcp_services(&self) -> bool {
+        !self.mcp_services.is_empty()
+    }
+
+    /// Read the last successfully synced timestamp for a named MCP service.
+    /// Returns `None` if the service has never successfully synced.
+    fn get_watermark(&self, service_name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let conn = self.conn.lock().ok()?;
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT last_synced_at FROM mcp_sync_watermark WHERE service_name = ?1",
+                [service_name],
+                |r| r.get(0),
+            )
+            .ok();
+        row.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+    }
+
+    /// Persist the new watermark for a named MCP service.
+    fn set_watermark(&self, service_name: &str, at: chrono::DateTime<chrono::Utc>) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "INSERT INTO mcp_sync_watermark (service_name, last_synced_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(service_name) DO UPDATE SET last_synced_at = excluded.last_synced_at",
+                rusqlite::params![service_name, at.to_rfc3339()],
+            );
+        }
+    }
+
+    /// Get all non-deleted memory fragments created after `since`, ordered ASC.
+    /// Used by the backfill task to find memories written during a service outage.
+    fn get_memories_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> OpenFangResult<Vec<MemoryFragment>> {
+        let store = self.semantic.clone();
+        let since_str = since.to_rfc3339();
+        tokio::task::block_in_place(|| store.get_memories_since(&since_str))
+    }
+
+    /// Push one memory fragment to all rank-1 MCP services (fire-and-forget).
+    /// Updates the per-service watermark on each successful push.
+    ///
+    /// Called as a detached task after every `remember()` — never blocks the caller.
+    pub async fn push_to_primary_services(&self, fragment: &MemoryFragment) {
+        for svc in self
+            .mcp_services
+            .iter()
+            .filter(|s| s.rank < self.sqlite_rank)
+        {
+            if svc.push(fragment).await {
+                self.set_watermark(&svc.name, fragment.created_at);
+            }
+        }
+    }
+
+    /// Push all memories created after this service's watermark (backfill).
+    ///
+    /// Returns the number of successfully pushed fragments.
+    /// Updates the watermark after each success so a partial run still makes progress.
+    pub async fn backfill_service(
+        &self,
+        svc: &crate::mcp_memory::McpMemoryBackend,
+    ) -> usize {
+        // Use epoch if no watermark (never synced)
+        let since = self.get_watermark(&svc.name).unwrap_or_else(|| {
+            chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+                .expect("static epoch string is valid")
+                .with_timezone(&chrono::Utc)
+        });
+
+        let fragments = match self.get_memories_since(since) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(service = %svc.name, "Failed to read memories for backfill: {e}");
+                return 0;
+            }
+        };
+
+        if fragments.is_empty() {
+            return 0;
+        }
+
+        tracing::info!(
+            service = %svc.name,
+            count   = fragments.len(),
+            since   = %since.to_rfc3339(),
+            "Backfilling memory fragments to MCP service"
+        );
+
+        let mut pushed = 0;
+        for frag in &fragments {
+            if svc.push(frag).await {
+                self.set_watermark(&svc.name, frag.created_at);
+                pushed += 1;
+            } else {
+                // Stop on first failure; next cycle will retry from the watermark
+                break;
+            }
+        }
+
+        if pushed > 0 {
+            tracing::info!(service = %svc.name, pushed, "MCP backfill complete");
+        }
+        pushed
+    }
+
+    /// Probe all configured MCP services via `GET /health` and backfill any that
+    /// are reachable and have un-synced memories.
+    ///
+    /// Called by the kernel's background sync task every 60 s.
+    pub async fn sync_mcp_services(&self) {
+        let probe_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        for svc in &self.mcp_services {
+            let reachable = probe_client
+                .get(svc.health_endpoint())
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+
+            if !reachable {
+                continue;
+            }
+
+            let watermark = self.get_watermark(&svc.name);
+            let needs_backfill = watermark.map_or(true, |wm| {
+                self.get_memories_since(wm)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            });
+
+            if needs_backfill {
+                self.backfill_service(svc).await;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Embedding-aware memory operations
     // -----------------------------------------------------------------
 
@@ -471,6 +621,10 @@ impl MemorySubstrate {
     }
 
     /// Async wrapper for `remember_with_embedding` — runs in a blocking thread.
+    ///
+    /// After the SQLite write, fires a best-effort push to all rank-1 MCP services
+    /// as a detached task. The push never blocks the caller — SQLite is always the
+    /// source of truth and the push is idempotent (QMD uses `ON CONFLICT DO UPDATE`).
     pub async fn remember_with_embedding_async(
         &self,
         agent_id: AgentId,
@@ -484,7 +638,8 @@ impl MemorySubstrate {
         let content = content.to_string();
         let scope = scope.to_string();
         let embedding_owned = embedding.map(|e| e.to_vec());
-        tokio::task::spawn_blocking(move || {
+
+        let id = tokio::task::spawn_blocking(move || {
             store.remember_with_embedding(
                 agent_id,
                 &content,
@@ -495,7 +650,50 @@ impl MemorySubstrate {
             )
         })
         .await
-        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+        .map_err(|e| OpenFangError::Internal(e.to_string()))??;
+
+        // Fire-and-forget push to rank-1 MCP services (best-effort, non-blocking).
+        let primary_services: Vec<_> = self
+            .mcp_services
+            .iter()
+            .filter(|s| s.rank < self.sqlite_rank)
+            .cloned()
+            .collect();
+
+        if !primary_services.is_empty() {
+            let store_ref = self.semantic.clone();
+            let conn_ref = Arc::clone(&self.conn);
+            let id_copy = id;
+            tokio::spawn(async move {
+                // Read back the fragment we just wrote so we have the full struct.
+                let frag = tokio::task::spawn_blocking(move || store_ref.get_by_id(id_copy))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
+
+                if let Some(fragment) = frag {
+                    for svc in &primary_services {
+                        if svc.push(&fragment).await {
+                            if let Ok(conn) = conn_ref.lock() {
+                                let _ = conn.execute(
+                                    "INSERT INTO mcp_sync_watermark (service_name, last_synced_at)
+                                     VALUES (?1, ?2)
+                                     ON CONFLICT(service_name) DO UPDATE
+                                     SET last_synced_at = excluded.last_synced_at",
+                                    rusqlite::params![
+                                        svc.name,
+                                        fragment.created_at.to_rfc3339()
+                                    ],
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(id)
     }
 
     // -----------------------------------------------------------------
